@@ -1,0 +1,174 @@
+# ====================================================
+# Robust Colab-ready Tire Burst & Road Debris Detection
+# - prints errors and tracebacks
+# - resizes frames for lower memory use
+# - saves output video as output.mp4 for download
+# ====================================================
+
+# 1) Install packages (use opencv-python so cv2_imshow works)
+!pip install --quiet --upgrade ultralytics opencv-python numpy
+
+# 2) Imports and helper functions
+import os, sys, traceback, time
+try:
+    import cv2
+    import numpy as np
+    from ultralytics import YOLO
+    from google.colab import files
+    from google.colab.patches import cv2_imshow
+except Exception as e:
+    print("❌ Import error:")
+    traceback.print_exc()
+    raise
+
+def print_exc_and_exit(msg="Error"):
+    print(f"❌ {msg}")
+    traceback.print_exc()
+    raise SystemExit
+
+# 3) Upload video file
+print("📤 Upload a video file (or press Cancel and provide a path if already on Colab).")
+try:
+    uploaded = files.upload()
+except Exception:
+    uploaded = {}
+
+if not uploaded:
+    print("⚠ No file uploaded via dialog. If you already placed a file in working directory, set video_path manually.")
+    # If user has a file in Colab environment, set it here:
+    # video_path = "/content/your_video.mp4"
+    # For now stop and ask user to upload
+    raise SystemExit("Please upload a video via the upload dialog above and re-run the cell.")
+
+# Use the first uploaded file
+video_path = list(uploaded.keys())[0]
+print("✅ Uploaded:", video_path)
+
+# 4) Load YOLO model (catch errors)
+model_weights = "yolov8n.pt"  # tiny model -> faster, lighter
+try:
+    print("⏳ Loading YOLO model (this may download weights)…")
+    model = YOLO(model_weights)
+    print("✅ YOLO model loaded.")
+except Exception:
+    print("❌ Failed to load the YOLO model. Traceback below:")
+    traceback.print_exc()
+    raise
+
+# 5) Parameters & helper for labels
+TARGET_CLASSES = ["tire", "wheel", "debris", "pothole", "car", "truck", "motorcycle"]
+def is_tire_burst_or_debris(label):
+    burst_keywords = ["burst", "damaged tire", "flat tire"]
+    debris_keywords = ["debris", "pothole", "rock", "object"]
+    return label.lower() in burst_keywords + debris_keywords
+
+# 6) Open video and prepare writer
+cap = cv2.VideoCapture(video_path)
+if not cap.isOpened():
+    print("❌ Cannot open uploaded video file. Check path and file format.")
+    raise SystemExit
+
+fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
+orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+print(f"Video properties: {orig_w}x{orig_h} @ {fps:.2f} FPS")
+
+# Reduce resolution to speed up processing and avoid OOM
+max_width = 960
+if orig_w > max_width:
+    scale = max_width / orig_w
+    target_w = int(orig_w * scale)
+    target_h = int(orig_h * scale)
+else:
+    target_w, target_h = orig_w, orig_h
+
+print(f"Processing at: {target_w}x{target_h}")
+
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+out_path = "output.mp4"
+writer = cv2.VideoWriter(out_path, fourcc, fps, (target_w, target_h))
+
+# 7) Detection loop with robust error handling
+frame_count = 0
+display_every_n = 5  # show every N-th processed frame
+
+try:
+    start = time.time()
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("⚠ End of video or cannot read further frames.")
+            break
+
+        frame_count += 1
+        # Resize for speed
+        if (frame.shape[1], frame.shape[0]) != (target_w, target_h):
+            frame = cv2.resize(frame, (target_w, target_h))
+
+        # Run inference - wrapped in try/except in case of runtime error
+        try:
+            results = model(frame, verbose=False)[0]
+        except Exception:
+            print("❌ Error during model inference on a frame. Traceback:")
+            traceback.print_exc()
+            # write original resized frame and continue (so output is still produced)
+            writer.write(frame)
+            continue
+
+        # Draw boxes
+        annotated = frame.copy()
+        try:
+            for box in results.boxes:
+                # box.xyxy may be tensor -> convert carefully
+                try:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                except Exception:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+                confidence = float(box.conf[0]) if hasattr(box, "conf") else 0.0
+                cls = int(box.cls[0]) if hasattr(box, "cls") else int(box.cls)
+                label = model.names[cls] if cls in model.names else str(cls)
+
+                if label in TARGET_CLASSES and confidence > 0.35:
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(annotated, f"{label} {confidence:.2f}", (x1, max(15, y1 - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+
+                    if is_tire_burst_or_debris(label):
+                        cv2.putText(annotated, "⚠ ALERT: Tire Burst / Road Debris Detected!",
+                                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+        except Exception:
+            print("❌ Error while drawing boxes. Traceback:")
+            traceback.print_exc()
+            writer.write(frame)
+            continue
+
+        # Write to output video
+        writer.write(annotated)
+
+        # Display every N-th frame to keep Colab responsive
+        if frame_count % display_every_n == 0:
+            try:
+                from IPython.display import clear_output
+                clear_output(wait=True)
+                cv2_imshow(annotated)
+            except Exception:
+                # If display fails, continue but keep writing file
+                print("⚠ Display failed for this frame; continuing (output still saved).")
+
+    elapsed = time.time() - start
+    print(f"✅ Done. Frames processed: {frame_count}. Time: {elapsed:.1f}s")
+except Exception:
+    print("❌ Unexpected error in main loop. Traceback:")
+    traceback.print_exc()
+finally:
+    cap.release()
+    writer.release()
+    cv2.destroyAllWindows()
+
+# 8) Offer output for download
+if os.path.exists(out_path):
+    print(f"📥 Output saved to {out_path}. Downloading now...")
+    files.download(out_path)
+else:
+    print("⚠ No output file was produced.")
